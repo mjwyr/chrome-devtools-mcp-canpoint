@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chrome-devtools-mcp-canpoint"
+version = "0.1.0"
+description = "Session-local Chrome launcher for Chrome DevTools MCP workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+  { name = "whqp" }
+]
+keywords = ["mcp", "chrome", "devtools", "browser", "automation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Debuggers",
+  "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/whqp/chrome-devtools-mcp-canpoint"
+Issues = "https://github.com/whqp/chrome-devtools-mcp-canpoint/issues"
+
+[project.scripts]
+chrome-devtools-mcp-canpoint = "chrome_devtools_mcp_canpoint.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
