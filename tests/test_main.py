@@ -225,6 +225,27 @@ class WrapperHelpersTest(unittest.TestCase):
         self.assertEqual(rmtree.call_count, 2)
         sleep.assert_called_once_with(0.01)
 
+    def test_resolve_downstream_command_prefers_windows_cmd_shim(self):
+        def fake_which(name):
+            return {"npx.cmd": r"C:\node\npx.cmd"}.get(name)
+
+        with mock.patch.object(main.os, "name", "nt"), mock.patch.dict(
+            main.os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}, clear=False
+        ), mock.patch.object(main.shutil, "which", side_effect=fake_which):
+            self.assertEqual(
+                main.resolve_downstream_command(["npx", "--version"]),
+                [r"C:\node\npx.cmd", "--version"],
+            )
+
+    def test_resolve_downstream_command_leaves_explicit_paths_unchanged(self):
+        with mock.patch.object(main.os, "name", "nt"), mock.patch.object(
+            main.shutil, "which"
+        ) as which:
+            command = [r"C:\Tools\npx.cmd", "--version"]
+
+            self.assertEqual(main.resolve_downstream_command(command), command)
+            which.assert_not_called()
+
     def test_bridge_stream_forwards_small_message_before_eof(self):
         source_read, source_write = os.pipe()
         target_read, target_write = os.pipe()

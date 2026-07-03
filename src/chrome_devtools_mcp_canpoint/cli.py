@@ -363,9 +363,35 @@ def remove_directory_with_retries(path: Path, attempts: int = 20, delay_seconds:
             time.sleep(delay_seconds)
 
 
+def resolve_downstream_command(command: Sequence[str]) -> list[str]:
+    resolved = list(command)
+    if not resolved or os.name != "nt":
+        return resolved
+
+    executable = resolved[0]
+    if any(separator in executable for separator in ("/", "\\")) or Path(executable).suffix:
+        return resolved
+
+    pathext = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
+    preferred_extensions = (".exe", ".cmd", ".bat", ".com")
+    extensions = sorted(
+        {extension.lower() for extension in pathext if extension},
+        key=lambda extension: preferred_extensions.index(extension)
+        if extension in preferred_extensions
+        else len(preferred_extensions),
+    )
+    for extension in extensions:
+        candidate = shutil.which(f"{executable}{extension}")
+        if candidate:
+            resolved[0] = candidate
+            return resolved
+
+    return resolved
+
+
 def run_downstream(command: Sequence[str], env: Mapping[str, str]) -> int:
     downstream = subprocess.Popen(
-        list(command),
+        resolve_downstream_command(command),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=None,

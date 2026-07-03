@@ -2,10 +2,15 @@
 
 Session-local Chrome launcher for Chrome DevTools MCP workflows.
 
+- Repository: https://github.com/mjwyr/chrome-devtools-mcp-canpoint.git
+- Author: 若清风
+
 This wrapper starts one dedicated Chrome process per MCP server process. Each
 session gets its own random remote debugging port and a generated user data
 directory under the current working directory, so multiple agent sessions do not
-fight over port `9222` or a shared Chrome profile.
+fight over port `9222` or a shared Chrome profile. On Windows it also resolves
+common command shims such as `npx.cmd`, so downstream MCP commands can be passed
+as normal argument lists.
 
 ## Usage
 
@@ -44,6 +49,46 @@ args = [
   "--no-usage-statistics"
 ]
 startup_timeout_sec = 60
+```
+
+## Claude Code MCP Config
+
+Claude Code stores global MCP server entries in `~/.claude.json` under
+`mcpServers`. A matching entry looks like this:
+
+```json
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "chrome-devtools-mcp-canpoint",
+        "--",
+        "npx",
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--browser-url={browser_url}"
+      ],
+      "env": {}
+    }
+  }
+}
+```
+
+Add it from PowerShell to avoid Git Bash/MSYS path conversion changing `/c`-style
+arguments:
+
+```powershell
+claude mcp add chrome-devtools -- uvx chrome-devtools-mcp-canpoint -- npx -y chrome-devtools-mcp@latest --browser-url={browser_url}
+```
+
+For older wrapper versions that do not resolve Windows command shims, use the
+temporary workaround below. It should not be needed after this package version is
+installed:
+
+```powershell
+claude mcp add chrome-devtools -- uvx chrome-devtools-mcp-canpoint -- cmd /c npx -y chrome-devtools-mcp@latest --browser-url={browser_url}
 ```
 
 ## Session Profile Directory
