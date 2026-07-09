@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import atexit
+import ctypes
 import os
 import shutil
 import signal
@@ -29,6 +31,9 @@ DEFAULT_CHROME_PATHS = (
 )
 DEFAULT_SESSION_ROOT_NAME = ".chrome-mcp-sessions"
 PROFILE_MODES = ("isolated", "inherit", "copy")
+WINDOW_MODES = ("quiet", "visible", "headless")
+LAUNCH_MODES = ("lazy", "eager")
+MCP_LAZY_TRIGGER_METHODS = frozenset({"tools/call", "resources/read", "prompts/get"})
 DEFAULT_SOURCE_PROFILE = "Default"
 ALWAYS_EXCLUDED_PROFILE_NAMES = frozenset(
     {
@@ -66,6 +71,7 @@ class ChromeSessionConfig:
     profile_directory: str | None
     headless: bool
     extra_args: tuple[str, ...]
+    window_mode: str = "visible"
 
 
 @dataclass(frozen=True)
@@ -73,6 +79,17 @@ class ProfileSelection:
     user_data_dir: Path
     generated_session_dir: bool
     profile_directory: str | None
+
+
+@dataclass(frozen=True)
+class ProfilePlan:
+    user_data_dir: Path
+    generated_session_dir: bool
+    profile_directory: str | None
+    profile_mode: str
+    source_user_data_dir: Path | None
+    source_profile: str
+    include_sensitive_profile_data: bool
 
 
 def find_free_port(host: str = "127.0.0.1") -> int:
@@ -97,10 +114,21 @@ def build_chrome_args(config: ChromeSessionConfig) -> list[str]:
     ]
     if config.profile_directory:
         args.append(f"--profile-directory={config.profile_directory}")
-    if config.headless:
+    if config.headless or config.window_mode == "headless":
         args.append("--headless=new")
+    elif config.window_mode == "quiet":
+        args.append("--start-minimized")
     args.extend(config.extra_args)
     return args
+
+
+def build_chrome_startupinfo(window_mode: str):
+    if os.name != "nt" or window_mode != "quiet":
+        return None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 7
+    return startupinfo
 
 
 def downstream_env(base_env: Mapping[str, str], port: int, user_data_dir: Path) -> dict[str, str]:
@@ -129,6 +157,60 @@ def expand_downstream_command(
     return [arg.format(**replacements) for arg in command]
 
 
+def encode_stdio_json(message: Mapping[str, object]) -> bytes:
+    payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
+
+
+def read_stdio_message(source) -> tuple[bytes, bytes] | None:
+    header_chunks: list[bytes] = []
+    content_length: int | None = None
+
+    while True:
+        line = source.readline()
+        if line == b"":
+            if header_chunks:
+                raise EOFError("Incomplete MCP stdio header.")
+            return None
+        header_chunks.append(line)
+        if line in (b"\r\n", b"\n"):
+            break
+        name, separator, value = line.partition(b":")
+        if separator and name.lower() == b"content-length":
+            content_length = int(value.strip())
+
+    if content_length is None:
+        raise ValueError("MCP stdio message missing Content-Length header.")
+
+    payload = source.read(content_length)
+    if len(payload) != content_length:
+        raise EOFError("Incomplete MCP stdio payload.")
+    return b"".join(header_chunks), payload
+
+
+def decode_json_rpc_payload(payload: bytes) -> dict | None:
+    try:
+        message = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if isinstance(message, dict):
+        return message
+    return None
+
+
+def json_rpc_startup_error(request_id: object, exc: Exception) -> bytes:
+    return encode_stdio_json(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": -32000,
+                "message": f"Chrome startup failed: {exc}",
+            },
+        }
+    )
+
+
 def resolve_session_root(value: str | None) -> Path:
     if value:
         return Path(value).resolve()
@@ -146,9 +228,13 @@ def default_chrome_user_data_dir() -> Path:
     return Path.home() / ".config" / "google-chrome"
 
 
-def resolve_source_user_data_dir(value: str | None) -> Path:
+def resolve_source_user_data_dir_path(value: str | None) -> Path:
     source_user_data_dir = Path(value).expanduser() if value else default_chrome_user_data_dir()
-    source_user_data_dir = source_user_data_dir.resolve()
+    return source_user_data_dir.resolve()
+
+
+def resolve_source_user_data_dir(value: str | None) -> Path:
+    source_user_data_dir = resolve_source_user_data_dir_path(value)
     if not source_user_data_dir.exists():
         raise FileNotFoundError(
             f"Chrome user data directory not found: {source_user_data_dir}"
@@ -215,6 +301,93 @@ def copy_chrome_local_state(
         shutil.copy2(local_state, target_user_data_dir / "Local State")
 
 
+def plan_user_data_dir(
+    user_data_dir: str | None,
+    profile_mode: str,
+    session_root: str | None,
+    source_user_data_dir: str | None,
+    source_profile: str,
+    include_sensitive_profile_data: bool,
+) -> ProfilePlan:
+    if user_data_dir:
+        return ProfilePlan(
+            Path(user_data_dir).expanduser().resolve(),
+            False,
+            None,
+            "explicit",
+            None,
+            source_profile,
+            include_sensitive_profile_data,
+        )
+
+    if profile_mode == "isolated":
+        return ProfilePlan(
+            resolve_session_root(session_root) / uuid.uuid4().hex,
+            True,
+            None,
+            "isolated",
+            None,
+            source_profile,
+            include_sensitive_profile_data,
+        )
+
+    if profile_mode in {"inherit", "copy"}:
+        source_root = resolve_source_user_data_dir_path(source_user_data_dir)
+        if profile_mode == "inherit":
+            return ProfilePlan(
+                source_root,
+                False,
+                source_profile,
+                "inherit",
+                source_root,
+                source_profile,
+                include_sensitive_profile_data,
+            )
+        return ProfilePlan(
+            resolve_session_root(session_root) / uuid.uuid4().hex,
+            True,
+            source_profile,
+            "copy",
+            source_root,
+            source_profile,
+            include_sensitive_profile_data,
+        )
+
+    raise ValueError(f"Unknown profile mode: {profile_mode}")
+
+
+def materialize_profile(plan: ProfilePlan) -> ProfileSelection:
+    if plan.profile_mode in {"explicit", "isolated"}:
+        plan.user_data_dir.mkdir(parents=True, exist_ok=True)
+        return ProfileSelection(
+            plan.user_data_dir,
+            plan.generated_session_dir,
+            plan.profile_directory,
+        )
+
+    if plan.profile_mode == "inherit":
+        source_root = resolve_source_user_data_dir(str(plan.source_user_data_dir))
+        resolve_source_profile_dir(source_root, plan.source_profile)
+        return ProfileSelection(source_root, False, plan.source_profile)
+
+    if plan.profile_mode == "copy":
+        source_root = resolve_source_user_data_dir(str(plan.source_user_data_dir))
+        copy_chrome_profile(
+            source_root,
+            plan.user_data_dir,
+            plan.source_profile,
+            plan.include_sensitive_profile_data,
+        )
+        copy_chrome_local_state(
+            source_root,
+            plan.user_data_dir,
+            plan.include_sensitive_profile_data,
+        )
+        return ProfileSelection(plan.user_data_dir, True, plan.source_profile)
+
+    raise ValueError(f"Unknown profile mode: {plan.profile_mode}")
+
+
 def select_user_data_dir(
     user_data_dir: str | None,
     profile_mode: str,
@@ -223,29 +396,16 @@ def select_user_data_dir(
     source_profile: str,
     include_sensitive_profile_data: bool,
 ) -> ProfileSelection:
-    if user_data_dir:
-        return ProfileSelection(Path(user_data_dir).expanduser().resolve(), False, None)
-
-    if profile_mode == "isolated":
-        return ProfileSelection(resolve_session_root(session_root) / uuid.uuid4().hex, True, None)
-
-    source_root = resolve_source_user_data_dir(source_user_data_dir)
-    resolve_source_profile_dir(source_root, source_profile)
-    if profile_mode == "inherit":
-        return ProfileSelection(source_root, False, source_profile)
-
-    if profile_mode == "copy":
-        target_root = resolve_session_root(session_root) / uuid.uuid4().hex
-        copy_chrome_profile(
-            source_root,
-            target_root,
+    return materialize_profile(
+        plan_user_data_dir(
+            user_data_dir,
+            profile_mode,
+            session_root,
+            source_user_data_dir,
             source_profile,
             include_sensitive_profile_data,
         )
-        copy_chrome_local_state(source_root, target_root, include_sensitive_profile_data)
-        return ProfileSelection(target_root, True, source_profile)
-
-    raise ValueError(f"Unknown profile mode: {profile_mode}")
+    )
 
 
 def resolve_chrome_path(value: str | None) -> Path:
@@ -299,6 +459,194 @@ def bridge_stream(source, target) -> None:
             target.close()
         except OSError:
             pass
+
+
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+
+
+class IO_COUNTERS(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+class WindowsProcessJob:
+    def __init__(self) -> None:
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._handle = self._kernel32.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = self._kernel32.SetInformationJobObject(
+            self._handle,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        )
+        if not ok:
+            error = ctypes.get_last_error()
+            self.close()
+            raise ctypes.WinError(error)
+
+    def add_process(self, process: subprocess.Popen[bytes]) -> None:
+        ok = self._kernel32.AssignProcessToJobObject(self._handle, int(process._handle))
+        if not ok:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = 0
+
+
+def create_process_job():
+    if os.name != "nt":
+        return None
+    try:
+        return WindowsProcessJob()
+    except OSError:
+        return None
+
+
+def add_process_to_job(process_job, process: subprocess.Popen[bytes]) -> None:
+    if process_job is None:
+        return
+    try:
+        process_job.add_process(process)
+    except OSError:
+        process_job.close()
+
+
+def start_chrome_process(config: ChromeSessionConfig) -> tuple[subprocess.Popen[bytes], object | None]:
+    process_job = create_process_job()
+    try:
+        chrome = subprocess.Popen(
+            build_chrome_args(config),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            startupinfo=build_chrome_startupinfo(config.window_mode),
+        )
+    except Exception:
+        if process_job is not None:
+            process_job.close()
+        raise
+    add_process_to_job(process_job, chrome)
+    return chrome, process_job
+
+
+class ChromeSessionManager:
+    def __init__(
+        self,
+        chrome_path_value: str | None,
+        port: int,
+        profile_plan: ProfilePlan,
+        keep_profile: bool,
+        devtools_timeout: float,
+        headless: bool,
+        window_mode: str,
+        extra_args: Sequence[str],
+    ) -> None:
+        self._chrome_path_value = chrome_path_value
+        self._port = port
+        self._profile_plan = profile_plan
+        self._keep_profile = keep_profile
+        self._devtools_timeout = devtools_timeout
+        self._headless = headless
+        self._window_mode = "headless" if headless else window_mode
+        self._extra_args = tuple(extra_args)
+        self._lock = threading.Lock()
+        self._chrome: subprocess.Popen[bytes] | None = None
+        self._chrome_process_job = None
+        self._started = False
+        self._profile_materialized = False
+
+    def ensure_started(self) -> None:
+        with self._lock:
+            if self._started:
+                if self._chrome is not None and self._chrome.poll() is None:
+                    return
+                raise RuntimeError("Chrome exited before the MCP request could be handled.")
+
+            profile_selection = materialize_profile(self._profile_plan)
+            self._profile_materialized = True
+            chrome_path = resolve_chrome_path(self._chrome_path_value)
+            config = ChromeSessionConfig(
+                chrome_path=chrome_path,
+                port=self._port,
+                user_data_dir=profile_selection.user_data_dir,
+                profile_directory=profile_selection.profile_directory,
+                headless=self._headless,
+                extra_args=self._extra_args,
+                window_mode=self._window_mode,
+            )
+            chrome, chrome_process_job = start_chrome_process(config)
+            self._chrome = chrome
+            self._chrome_process_job = chrome_process_job
+            try:
+                wait_for_devtools(self._port, self._devtools_timeout)
+            except Exception:
+                terminate_process(chrome)
+                if chrome_process_job is not None:
+                    chrome_process_job.close()
+                self._chrome = None
+                self._chrome_process_job = None
+                if profile_selection.generated_session_dir and not self._keep_profile:
+                    remove_directory_with_retries(profile_selection.user_data_dir)
+                self._profile_materialized = False
+                raise
+            self._started = True
+
+    def cleanup(self) -> None:
+        with self._lock:
+            chrome = self._chrome
+            chrome_process_job = self._chrome_process_job
+            profile_materialized = self._profile_materialized
+            self._chrome = None
+            self._chrome_process_job = None
+            self._started = False
+            self._profile_materialized = False
+
+        if chrome is not None:
+            terminate_process(chrome)
+            if chrome_process_job is not None:
+                chrome_process_job.close()
+            terminate_chrome_profile_processes(self._profile_plan.user_data_dir)
+        if profile_materialized and self._profile_plan.generated_session_dir and not self._keep_profile:
+            remove_directory_with_retries(self._profile_plan.user_data_dir)
 
 
 def terminate_process(process: subprocess.Popen[bytes], timeout_seconds: float = 5) -> None:
@@ -363,6 +711,39 @@ def remove_directory_with_retries(path: Path, attempts: int = 20, delay_seconds:
             time.sleep(delay_seconds)
 
 
+def bridge_mcp_client_stream(source, target, ensure_chrome, error_target, log_target) -> None:
+    try:
+        while True:
+            message = read_stdio_message(source)
+            if message is None:
+                break
+            headers, payload = message
+            json_rpc_message = decode_json_rpc_payload(payload)
+
+            if (
+                json_rpc_message is not None
+                and json_rpc_message.get("method") in MCP_LAZY_TRIGGER_METHODS
+            ):
+                try:
+                    ensure_chrome()
+                except Exception as exc:
+                    if "id" in json_rpc_message:
+                        error_target.write(json_rpc_startup_error(json_rpc_message.get("id"), exc))
+                        error_target.flush()
+                    else:
+                        print(f"Chrome startup failed: {exc}", file=log_target)
+                    continue
+
+            target.write(headers)
+            target.write(payload)
+            target.flush()
+    finally:
+        try:
+            target.close()
+        except OSError:
+            pass
+
+
 def resolve_downstream_command(command: Sequence[str]) -> list[str]:
     resolved = list(command)
     if not resolved or os.name != "nt":
@@ -389,7 +770,7 @@ def resolve_downstream_command(command: Sequence[str]) -> list[str]:
     return resolved
 
 
-def run_downstream(command: Sequence[str], env: Mapping[str, str]) -> int:
+def run_downstream(command: Sequence[str], env: Mapping[str, str], ensure_chrome=None) -> int:
     downstream = subprocess.Popen(
         resolve_downstream_command(command),
         stdin=subprocess.PIPE,
@@ -398,11 +779,24 @@ def run_downstream(command: Sequence[str], env: Mapping[str, str]) -> int:
         env=dict(env),
     )
 
-    stdin_thread = threading.Thread(
-        target=bridge_stream,
-        args=(sys.stdin.buffer, downstream.stdin),
-        daemon=True,
-    )
+    if ensure_chrome is None:
+        stdin_thread = threading.Thread(
+            target=bridge_stream,
+            args=(sys.stdin.buffer, downstream.stdin),
+            daemon=True,
+        )
+    else:
+        stdin_thread = threading.Thread(
+            target=bridge_mcp_client_stream,
+            args=(
+                sys.stdin.buffer,
+                downstream.stdin,
+                ensure_chrome,
+                sys.stdout.buffer,
+                sys.stderr,
+            ),
+            daemon=True,
+        )
     stdout_thread = threading.Thread(
         target=bridge_stream,
         args=(downstream.stdout, sys.stdout.buffer),
@@ -432,7 +826,7 @@ def run_downstream(command: Sequence[str], env: Mapping[str, str]) -> int:
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Start a session-local Chrome instance and run a downstream MCP command."
+        description="Run a downstream Chrome DevTools MCP command with a session-local Chrome endpoint."
     )
     parser.add_argument(
         "--chrome-path",
@@ -473,9 +867,21 @@ def create_parser() -> argparse.ArgumentParser:
         help="Do not delete the session profile after the downstream command exits.",
     )
     parser.add_argument(
+        "--launch-mode",
+        choices=LAUNCH_MODES,
+        default="lazy",
+        help="When to start Chrome: lazy (default) starts on first browser-backed MCP request; eager preserves startup-time launch behavior.",
+    )
+    parser.add_argument(
+        "--window-mode",
+        choices=WINDOW_MODES,
+        default="quiet",
+        help="Chrome window mode: quiet (default), visible, or headless.",
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
-        help="Start Chrome in headless mode.",
+        help="Backward-compatible alias for --window-mode headless.",
     )
     parser.add_argument(
         "--devtools-timeout",
@@ -512,8 +918,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         command = normalize_command(args.command)
-        chrome_path = resolve_chrome_path(args.chrome_path)
-        profile_selection = select_user_data_dir(
+        port = find_free_port()
+        profile_plan = plan_user_data_dir(
             args.user_data_dir,
             args.profile_mode,
             args.session_root,
@@ -521,36 +927,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.source_profile,
             args.include_sensitive_profile_data,
         )
-        user_data_dir = profile_selection.user_data_dir
-        generated_session_dir = profile_selection.generated_session_dir
-        profile_directory = profile_selection.profile_directory
     except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
         parser.error(str(exc))
 
-    port = find_free_port()
-    user_data_dir.mkdir(parents=True, exist_ok=True)
-
-    config = ChromeSessionConfig(
-        chrome_path=chrome_path,
+    window_mode = "headless" if args.headless else args.window_mode
+    chrome_session = ChromeSessionManager(
+        chrome_path_value=args.chrome_path,
         port=port,
-        user_data_dir=user_data_dir,
-        profile_directory=profile_directory,
+        profile_plan=profile_plan,
+        keep_profile=args.keep_profile,
+        devtools_timeout=args.devtools_timeout,
         headless=args.headless,
+        window_mode=window_mode,
         extra_args=tuple(args.chrome_arg),
     )
 
-    chrome = subprocess.Popen(
-        build_chrome_args(config),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
     def cleanup() -> None:
-        terminate_process(chrome)
-        terminate_chrome_profile_processes(user_data_dir)
-        if generated_session_dir and not args.keep_profile:
-            remove_directory_with_retries(user_data_dir)
+        chrome_session.cleanup()
 
     atexit.register(cleanup)
 
@@ -565,15 +958,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, handle_sigterm)
 
     try:
-        wait_for_devtools(port, args.devtools_timeout)
-        env = downstream_env(os.environ, port, user_data_dir)
-        expanded_command = expand_downstream_command(command, port, user_data_dir)
-        return run_downstream(expanded_command, env)
+        if args.launch_mode == "eager":
+            chrome_session.ensure_started()
+        env = downstream_env(os.environ, port, profile_plan.user_data_dir)
+        expanded_command = expand_downstream_command(command, port, profile_plan.user_data_dir)
+        ensure_chrome = chrome_session.ensure_started if args.launch_mode == "lazy" else None
+        return run_downstream(expanded_command, env, ensure_chrome)
+    except (FileNotFoundError, NotADirectoryError, ValueError, TimeoutError) as exc:
+        parser.error(str(exc))
     except KeyboardInterrupt:
         return 130
     finally:
         cleanup()
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

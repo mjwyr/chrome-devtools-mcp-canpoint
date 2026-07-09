@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import sys
 import tempfile
@@ -9,6 +11,25 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from chrome_devtools_mcp_canpoint import cli as main
+
+
+class RecordingBinarySink:
+    def __init__(self):
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, chunk):
+        self.data.extend(chunk)
+        return len(chunk)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def getvalue(self):
+        return bytes(self.data)
 
 
 class WrapperHelpersTest(unittest.TestCase):
@@ -45,6 +66,54 @@ class WrapperHelpersTest(unittest.TestCase):
         self.assertIn("--headless=new", args)
         self.assertIn("--window-size=1200,900", args)
 
+    def test_build_chrome_args_quiet_adds_start_minimized(self):
+        config = main.ChromeSessionConfig(
+            chrome_path=Path(r"C:\Chrome\chrome.exe"),
+            port=45678,
+            user_data_dir=Path(r"C:\Temp\profile"),
+            profile_directory=None,
+            headless=False,
+            extra_args=(),
+            window_mode="quiet",
+        )
+
+        args = main.build_chrome_args(config)
+
+        self.assertIn("--start-minimized", args)
+        self.assertNotIn("--headless=new", args)
+
+    def test_build_chrome_args_visible_does_not_add_quiet_or_headless_flags(self):
+        config = main.ChromeSessionConfig(
+            chrome_path=Path(r"C:\Chrome\chrome.exe"),
+            port=45678,
+            user_data_dir=Path(r"C:\Temp\profile"),
+            profile_directory=None,
+            headless=False,
+            extra_args=(),
+            window_mode="visible",
+        )
+
+        args = main.build_chrome_args(config)
+
+        self.assertNotIn("--start-minimized", args)
+        self.assertNotIn("--headless=new", args)
+
+    def test_build_chrome_args_window_mode_headless_adds_headless(self):
+        config = main.ChromeSessionConfig(
+            chrome_path=Path(r"C:\Chrome\chrome.exe"),
+            port=45678,
+            user_data_dir=Path(r"C:\Temp\profile"),
+            profile_directory=None,
+            headless=False,
+            extra_args=(),
+            window_mode="headless",
+        )
+
+        args = main.build_chrome_args(config)
+
+        self.assertIn("--headless=new", args)
+        self.assertNotIn("--start-minimized", args)
+
     def test_normalize_command_strips_separator(self):
         self.assertEqual(
             main.normalize_command(["--", "npx", "chrome-devtools-mcp"]),
@@ -54,6 +123,64 @@ class WrapperHelpersTest(unittest.TestCase):
     def test_normalize_command_rejects_empty_command(self):
         with self.assertRaises(ValueError):
             main.normalize_command(["--"])
+
+    def test_main_lazy_mode_passes_startup_callback_without_prestarting_chrome(self):
+        plan = main.ProfilePlan(
+            user_data_dir=Path(r"C:\Temp\profile"),
+            generated_session_dir=True,
+            profile_directory=None,
+            profile_mode="isolated",
+            source_user_data_dir=None,
+            source_profile="Default",
+            include_sensitive_profile_data=False,
+        )
+        manager = mock.Mock()
+        run_calls = []
+
+        def fake_run_downstream(command, env, ensure_chrome=None):
+            run_calls.append((command, env, ensure_chrome))
+            return 0
+
+        with mock.patch.object(main, "find_free_port", return_value=45678), mock.patch.object(
+            main, "plan_user_data_dir", return_value=plan
+        ), mock.patch.object(main, "ChromeSessionManager", return_value=manager), mock.patch.object(
+            main, "run_downstream", side_effect=fake_run_downstream
+        ), mock.patch.object(main.atexit, "register"), mock.patch.object(main.signal, "signal"):
+            result = main.main(["--", "npx", "server", "--browser-url={browser_url}"])
+
+        self.assertEqual(result, 0)
+        manager.ensure_started.assert_not_called()
+        self.assertEqual(run_calls[0][0], ["npx", "server", "--browser-url=http://127.0.0.1:45678"])
+        self.assertIs(run_calls[0][2], manager.ensure_started)
+
+    def test_main_eager_mode_starts_chrome_before_downstream(self):
+        plan = main.ProfilePlan(
+            user_data_dir=Path(r"C:\Temp\profile"),
+            generated_session_dir=True,
+            profile_directory=None,
+            profile_mode="isolated",
+            source_user_data_dir=None,
+            source_profile="Default",
+            include_sensitive_profile_data=False,
+        )
+        events = []
+        manager = mock.Mock()
+        manager.ensure_started.side_effect = lambda: events.append("start")
+
+        def fake_run_downstream(command, env, ensure_chrome=None):
+            events.append("run")
+            self.assertIsNone(ensure_chrome)
+            return 0
+
+        with mock.patch.object(main, "find_free_port", return_value=45678), mock.patch.object(
+            main, "plan_user_data_dir", return_value=plan
+        ), mock.patch.object(main, "ChromeSessionManager", return_value=manager), mock.patch.object(
+            main, "run_downstream", side_effect=fake_run_downstream
+        ), mock.patch.object(main.atexit, "register"), mock.patch.object(main.signal, "signal"):
+            result = main.main(["--launch-mode", "eager", "--", "npx", "server"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(events, ["start", "run"])
 
     def test_expand_downstream_command_replaces_session_placeholders(self):
         command = [
@@ -196,6 +323,35 @@ class WrapperHelpersTest(unittest.TestCase):
                 "bookmarks",
             )
 
+    def test_plan_user_data_dir_copy_defers_profile_copy_until_materialized(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            (source / "Default").mkdir(parents=True)
+            (source / "Default" / "Bookmarks").write_text("bookmarks", encoding="utf-8")
+            session_root = root / "sessions"
+
+            plan = main.plan_user_data_dir(
+                None,
+                "copy",
+                str(session_root),
+                str(source),
+                "Default",
+                False,
+            )
+
+            self.assertEqual(plan.user_data_dir.parent, session_root.resolve())
+            self.assertFalse((plan.user_data_dir / "Default").exists())
+
+            selection = main.materialize_profile(plan)
+
+            self.assertTrue(selection.generated_session_dir)
+            self.assertEqual(selection.profile_directory, "Default")
+            self.assertEqual(
+                (selection.user_data_dir / "Default" / "Bookmarks").read_text(encoding="utf-8"),
+                "bookmarks",
+            )
+
     @unittest.skipUnless(os.name == "nt", "Windows-specific process tree cleanup")
     def test_terminate_process_uses_taskkill_process_tree_on_windows(self):
         process = mock.Mock()
@@ -246,6 +402,99 @@ class WrapperHelpersTest(unittest.TestCase):
             self.assertEqual(main.resolve_downstream_command(command), command)
             which.assert_not_called()
 
+    def test_create_process_job_returns_none_outside_windows(self):
+        with mock.patch.object(main.os, "name", "posix"):
+            self.assertIsNone(main.create_process_job())
+
+    def test_create_process_job_returns_none_when_windows_job_creation_fails(self):
+        with mock.patch.object(main.os, "name", "nt"), mock.patch.object(
+            main, "WindowsProcessJob", side_effect=OSError("job unavailable")
+        ):
+            self.assertIsNone(main.create_process_job())
+
+    def test_add_process_to_job_closes_job_when_assignment_fails(self):
+        process_job = mock.Mock()
+        process_job.add_process.side_effect = OSError("assign failed")
+        process = mock.Mock()
+
+        main.add_process_to_job(process_job, process)
+
+        process_job.add_process.assert_called_once_with(process)
+        process_job.close.assert_called_once_with()
+
+    def test_chrome_session_manager_ensure_started_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = main.ProfilePlan(
+                user_data_dir=Path(temp_dir) / "profile",
+                generated_session_dir=True,
+                profile_directory=None,
+                profile_mode="isolated",
+                source_user_data_dir=None,
+                source_profile="Default",
+                include_sensitive_profile_data=False,
+            )
+            process = mock.Mock()
+            process.poll.return_value = None
+            process_job = mock.Mock()
+
+            with mock.patch.object(
+                main, "resolve_chrome_path", return_value=Path(r"C:\Chrome\chrome.exe")
+            ) as resolve_chrome_path, mock.patch.object(
+                main, "start_chrome_process", return_value=(process, process_job)
+            ) as start_chrome_process, mock.patch.object(
+                main, "wait_for_devtools"
+            ) as wait_for_devtools:
+                manager = main.ChromeSessionManager(
+                    chrome_path_value=None,
+                    port=45678,
+                    profile_plan=plan,
+                    keep_profile=False,
+                    devtools_timeout=5.0,
+                    headless=False,
+                    window_mode="quiet",
+                    extra_args=(),
+                )
+
+                manager.ensure_started()
+                manager.ensure_started()
+
+            resolve_chrome_path.assert_called_once_with(None)
+            start_chrome_process.assert_called_once()
+            wait_for_devtools.assert_called_once_with(45678, 5.0)
+
+    def test_chrome_session_manager_cleanup_without_start_does_not_terminate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = main.ProfilePlan(
+                user_data_dir=Path(temp_dir) / "profile",
+                generated_session_dir=True,
+                profile_directory=None,
+                profile_mode="isolated",
+                source_user_data_dir=None,
+                source_profile="Default",
+                include_sensitive_profile_data=False,
+            )
+            manager = main.ChromeSessionManager(
+                chrome_path_value=None,
+                port=45678,
+                profile_plan=plan,
+                keep_profile=False,
+                devtools_timeout=5.0,
+                headless=False,
+                window_mode="quiet",
+                extra_args=(),
+            )
+
+            with mock.patch.object(main, "terminate_process") as terminate_process, mock.patch.object(
+                main, "terminate_chrome_profile_processes"
+            ) as terminate_chrome_profile_processes, mock.patch.object(
+                main, "remove_directory_with_retries"
+            ) as remove_directory_with_retries:
+                manager.cleanup()
+
+            terminate_process.assert_not_called()
+            terminate_chrome_profile_processes.assert_not_called()
+            remove_directory_with_retries.assert_not_called()
+
     def test_bridge_stream_forwards_small_message_before_eof(self):
         source_read, source_write = os.pipe()
         target_read, target_write = os.pipe()
@@ -262,6 +511,74 @@ class WrapperHelpersTest(unittest.TestCase):
             os.close(target_read)
 
         self.assertEqual(forwarded, message)
+
+    def test_bridge_mcp_client_stream_does_not_start_chrome_for_non_trigger_messages(self):
+        first = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        second = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+        framed = main.encode_stdio_json(first) + main.encode_stdio_json(second)
+        target = RecordingBinarySink()
+        errors = RecordingBinarySink()
+        starts = []
+
+        main.bridge_mcp_client_stream(
+            io.BytesIO(framed),
+            target,
+            lambda: starts.append("started"),
+            errors,
+            io.StringIO(),
+        )
+
+        self.assertEqual(starts, [])
+        self.assertEqual(target.getvalue(), framed)
+        self.assertEqual(errors.getvalue(), b"")
+
+    def test_bridge_mcp_client_stream_starts_chrome_before_trigger_message(self):
+        trigger = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {}}
+        framed = main.encode_stdio_json(trigger)
+        events = []
+
+        class EventSink(RecordingBinarySink):
+            def write(self, chunk):
+                events.append("write")
+                return super().write(chunk)
+
+        def ensure_chrome():
+            events.append("start")
+
+        target = EventSink()
+        main.bridge_mcp_client_stream(
+            io.BytesIO(framed),
+            target,
+            ensure_chrome,
+            RecordingBinarySink(),
+            io.StringIO(),
+        )
+
+        self.assertEqual(events[0], "start")
+        self.assertEqual(target.getvalue(), framed)
+
+    def test_bridge_mcp_client_stream_returns_error_when_lazy_start_fails(self):
+        trigger = {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {}}
+        target = RecordingBinarySink()
+        errors = RecordingBinarySink()
+
+        def ensure_chrome():
+            raise RuntimeError("boom")
+
+        main.bridge_mcp_client_stream(
+            io.BytesIO(main.encode_stdio_json(trigger)),
+            target,
+            ensure_chrome,
+            errors,
+            io.StringIO(),
+        )
+
+        self.assertEqual(target.getvalue(), b"")
+        _, payload = main.read_stdio_message(io.BytesIO(errors.getvalue()))
+        response = json.loads(payload.decode("utf-8"))
+        self.assertEqual(response["id"], 7)
+        self.assertEqual(response["error"]["code"], -32000)
+        self.assertIn("Chrome startup failed: boom", response["error"]["message"])
 
     @unittest.skipUnless(os.name == "nt", "Windows-specific Chrome cleanup")
     def test_terminate_chrome_profile_processes_filters_by_profile_path(self):

@@ -51,8 +51,8 @@ If Windows file-lock cleanup causes trouble, build separately:
 Expected files:
 
 ```text
-dist/chrome_devtools_mcp_canpoint-0.1.0-py3-none-any.whl
-dist/chrome_devtools_mcp_canpoint-0.1.0.tar.gz
+dist/chrome_devtools_mcp_canpoint-<version>-py3-none-any.whl
+dist/chrome_devtools_mcp_canpoint-<version>.tar.gz
 ```
 
 ## Validate Distributions
@@ -115,10 +115,27 @@ startup_timeout_sec = 60
 Before publishing another release:
 
 1. Update `version` in `pyproject.toml`.
-2. Update `__version__` in `src/chrome_devtools_mcp_canpoint/__init__.py`.
+2. Remove old `dist/` files before rebuilding.
 3. Re-run tests.
 4. Rebuild `dist/`.
-5. Upload with `twine`.
+5. Run `twine check dist/*`.
+6. Upload with `twine`.
 
-PyPI does not allow replacing an existing version. If upload partially succeeds,
-bump the version before retrying.
+PyPI does not allow replacing an existing version. If upload returns `HTTPError:
+400 Bad Request`, first check whether the same version already exists:
+
+```powershell
+@'
+import json, urllib.error, urllib.request
+name = "chrome-devtools-mcp-canpoint"
+version = "0.1.1"
+try:
+    urllib.request.urlopen(f"https://pypi.org/pypi/{name}/{version}/json", timeout=15)
+    print(f"{name}=={version} already exists; bump the version")
+except urllib.error.HTTPError as exc:
+    print("not published yet" if exc.code == 404 else f"HTTP {exc.code}")
+'@ | .\.venv\Scripts\python.exe -
+```
+
+If an API token is pasted into chat, logs, or a public issue, revoke it in PyPI
+immediately and create a new project-scoped token before uploading again.

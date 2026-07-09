@@ -5,12 +5,13 @@ Session-local Chrome launcher for Chrome DevTools MCP workflows.
 - Repository: https://github.com/mjwyr/chrome-devtools-mcp-canpoint.git
 - Author: 若清风
 
-This wrapper starts one dedicated Chrome process per MCP server process. Each
-session gets its own random remote debugging port and a generated user data
-directory under the current working directory, so multiple agent sessions do not
-fight over port `9222` or a shared Chrome profile. On Windows it also resolves
-common command shims such as `npx.cmd`, so downstream MCP commands can be passed
-as normal argument lists.
+This wrapper gives each MCP server process its own random remote debugging port
+and generated user data directory, so multiple agent sessions do not fight over
+port `9222` or a shared Chrome profile. By default, the actual Chrome process is
+started lazily: normal MCP startup and tool discovery can complete without
+opening a browser, and Chrome is launched only when the conversation first calls
+a browser-backed MCP tool. On Windows it also resolves common command shims such
+as `npx.cmd`, so downstream MCP commands can be passed as normal argument lists.
 
 ## Usage
 
@@ -24,6 +25,24 @@ Example:
 
 ```powershell
 uvx chrome-devtools-mcp-canpoint -- npx -y chrome-devtools-mcp@latest --browser-url={browser_url}
+```
+
+By default, Chrome starts in lazy mode and uses quiet window startup. Quiet mode
+keeps Chrome headful for compatibility, adds `--start-minimized`, and uses a
+best-effort non-activating minimized startup on Windows. It reduces focus
+stealing but cannot guarantee Chrome or the OS will never focus the window.
+
+Preserve the old startup-time launch behavior with:
+
+```powershell
+uvx chrome-devtools-mcp-canpoint --launch-mode eager -- <downstream-mcp-command>
+```
+
+Force a fully headless browser with either option:
+
+```powershell
+uvx chrome-devtools-mcp-canpoint --window-mode headless -- <downstream-mcp-command>
+uvx chrome-devtools-mcp-canpoint --headless -- <downstream-mcp-command>
 ```
 
 If Chrome is not installed in the default Windows location, pass it explicitly:
@@ -180,8 +199,17 @@ arguments:
 
 ## Cleanup
 
-When the downstream MCP exits, this wrapper terminates only the Chrome process it
-started. Temporary profiles are deleted by default.
+When the downstream MCP exits, stdin closes, `Ctrl+C` is received, or the MCP
+client closes the session, this wrapper terminates only the Chrome process it
+started. If lazy mode never needed Chrome, no browser process is started. On
+Windows, Chrome is also assigned to a Job Object with `KILL_ON_JOB_CLOSE`, so the
+browser is cleaned up when the wrapper process exits unexpectedly in normal
+session-shutdown paths. Temporary profiles are deleted by default after they have
+actually been materialized.
+
+A forced process kill that prevents Windows or Python cleanup from running can
+still leave Chrome behind; restart the MCP client or close that Chrome process if
+that happens.
 
 Use `--keep-profile` when debugging:
 
@@ -205,7 +233,9 @@ Useful options:
 - `--session-root`: parent directory for generated project-local profiles
 - `--user-data-dir`: explicit profile directory instead of a generated one
 - `--keep-profile`: leave the temporary profile on disk
-- `--headless`: start Chrome with `--headless=new`
+- `--launch-mode`: `lazy` (default) or `eager`
+- `--window-mode`: `quiet` (default), `visible`, or `headless`
+- `--headless`: backward-compatible alias for `--window-mode headless`
 - `--chrome-arg`: pass extra arguments to Chrome, repeatable
 - `--devtools-timeout`: seconds to wait for `/json/version`
 
