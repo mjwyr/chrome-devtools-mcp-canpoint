@@ -204,6 +204,74 @@ class WrapperHelpersTest(unittest.TestCase):
             ],
         )
 
+    def test_find_chrome_devtools_mcp_metadata_command_extracts_npx_package(self):
+        with mock.patch.object(main.os, "name", "nt"):
+            metadata = main.find_chrome_devtools_mcp_metadata_command(
+                [
+                    r"C:\node\npx.cmd",
+                    "-y",
+                    "chrome-devtools-mcp@latest",
+                    "--browser-url=http://127.0.0.1:45678",
+                    "--no-usage-statistics",
+                ]
+            )
+
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata.npx_command, r"C:\node\npx.cmd")
+        self.assertEqual(metadata.package_spec, "chrome-devtools-mcp@latest")
+        self.assertEqual(
+            metadata.server_args,
+            ("--browser-url=http://127.0.0.1:45678", "--no-usage-statistics"),
+        )
+
+    def test_find_chrome_devtools_mcp_metadata_command_resolves_nested_npx_shim(self):
+        def fake_which(name):
+            return {"npx.cmd": r"C:\node\npx.cmd"}.get(name)
+
+        with mock.patch.object(main.os, "name", "nt"), mock.patch.dict(
+            main.os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}, clear=False
+        ), mock.patch.object(main.shutil, "which", side_effect=fake_which):
+            metadata = main.find_chrome_devtools_mcp_metadata_command(
+                [
+                    "cmd",
+                    "/c",
+                    "npx",
+                    "-y",
+                    "chrome-devtools-mcp@latest",
+                    "--browser-url=http://127.0.0.1:45678",
+                ]
+            )
+
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata.npx_command, r"C:\node\npx.cmd")
+        self.assertEqual(metadata.package_spec, "chrome-devtools-mcp@latest")
+        self.assertEqual(metadata.server_args, ("--browser-url=http://127.0.0.1:45678",))
+
+    def test_chrome_devtools_mcp_tools_list_metadata_reads_node_script_from_stdin(self):
+        completed = main.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"tools":[{"name":"sample"}]}',
+            stderr="",
+        )
+
+        with mock.patch.object(main.subprocess, "run", return_value=completed) as run:
+            metadata = main.chrome_devtools_mcp_tools_list_metadata(
+                main.ChromeDevToolsMcpMetadataCommand(
+                    r"C:\node\npx.cmd",
+                    "chrome-devtools-mcp@latest",
+                    ("--browser-url=http://127.0.0.1:45678",),
+                ),
+                {"PATH": r"C:\node"},
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[:6], [r"C:\node\npx.cmd", "-y", "-p", "chrome-devtools-mcp@latest", "node", "--input-type=module"])
+        self.assertEqual(command[6], "-")
+        self.assertEqual(json.loads(command[7]), ["--browser-url=http://127.0.0.1:45678"])
+        self.assertIn("createMcpServer", run.call_args.kwargs["input"])
+        self.assertEqual(metadata["tools"][0]["name"], "sample")
+
     def test_resolve_chrome_path_uses_explicit_existing_path(self):
         path = Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe"
 
@@ -512,9 +580,43 @@ class WrapperHelpersTest(unittest.TestCase):
 
         self.assertEqual(forwarded, message)
 
-    def test_bridge_mcp_client_stream_does_not_start_chrome_for_non_trigger_messages(self):
+    def test_bridge_mcp_server_stream_suppresses_handled_initialize_response(self):
+        initialize_response = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+        tool_response = {"jsonrpc": "2.0", "id": 3, "result": {"content": []}}
+        framed = main.encode_stdio_json(initialize_response) + main.encode_stdio_json(tool_response)
+        target = RecordingBinarySink()
+
+        main.bridge_mcp_server_stream(
+            io.BytesIO(framed),
+            target,
+            {1},
+            threading.Lock(),
+        )
+
+        _, payload = main.read_stdio_message(io.BytesIO(target.getvalue()))
+        response = json.loads(payload.decode("utf-8"))
+        self.assertEqual(response["id"], 3)
+
+    def test_read_stdio_message_accepts_newline_delimited_json(self):
+        payload = b'{"jsonrpc":"2.0","id":1,"method":"initialize"}\n'
+
+        headers, body = main.read_stdio_message(io.BytesIO(payload))
+
+        self.assertEqual(headers, b"")
+        self.assertEqual(json.loads(body.decode("utf-8"))["method"], "initialize")
+
+    def test_read_stdio_message_accepts_content_length_framing(self):
+        payload = b'{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+        framed = b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
+
+        headers, body = main.read_stdio_message(io.BytesIO(framed))
+
+        self.assertIn(b"Content-Length", headers)
+        self.assertEqual(json.loads(body.decode("utf-8"))["method"], "initialize")
+
+    def test_bridge_mcp_client_stream_answers_initialize_without_downstream_or_chrome(self):
         first = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
-        second = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+        second = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
         framed = main.encode_stdio_json(first) + main.encode_stdio_json(second)
         target = RecordingBinarySink()
         errors = RecordingBinarySink()
@@ -529,8 +631,146 @@ class WrapperHelpersTest(unittest.TestCase):
         )
 
         self.assertEqual(starts, [])
-        self.assertEqual(target.getvalue(), framed)
-        self.assertEqual(errors.getvalue(), b"")
+        self.assertEqual(target.getvalue(), b"")
+        _, payload = main.read_stdio_message(io.BytesIO(errors.getvalue()))
+        response = json.loads(payload.decode("utf-8"))
+        self.assertEqual(response["id"], 1)
+        self.assertEqual(response["result"]["serverInfo"]["name"], "chrome-devtools-mcp-canpoint")
+
+    def test_bridge_mcp_client_stream_replays_initialize_before_first_trigger(self):
+        initialize = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        initialized = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+        trigger = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {}}
+        framed = (
+            main.encode_stdio_json(initialize)
+            + main.encode_stdio_json(initialized)
+            + main.encode_stdio_json(trigger)
+        )
+        target = RecordingBinarySink()
+
+        main.bridge_mcp_client_stream(
+            io.BytesIO(framed),
+            target,
+            lambda: None,
+            RecordingBinarySink(),
+            io.StringIO(),
+        )
+
+        forwarded_messages = []
+        forwarded = io.BytesIO(target.getvalue())
+        while True:
+            message = main.read_stdio_message(forwarded)
+            if message is None:
+                break
+            _, payload = message
+            forwarded_messages.append(json.loads(payload.decode("utf-8")))
+
+        self.assertEqual([message["method"] for message in forwarded_messages], [
+            "initialize",
+            "notifications/initialized",
+            "tools/call",
+        ])
+
+    def test_bridge_mcp_client_stream_synthesizes_tools_list_without_chrome(self):
+        trigger = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+        framed = main.encode_stdio_json(trigger)
+        target = RecordingBinarySink()
+        response_target = RecordingBinarySink()
+        starts = []
+
+        main.bridge_mcp_client_stream(
+            io.BytesIO(framed),
+            target,
+            lambda: starts.append("start"),
+            response_target,
+            io.StringIO(),
+            lambda: {"tools": [{"name": "sample", "inputSchema": {"type": "object"}}]},
+        )
+
+        self.assertEqual(starts, [])
+        self.assertEqual(target.getvalue(), b"")
+        _, payload = main.read_stdio_message(io.BytesIO(response_target.getvalue()))
+        response = json.loads(payload.decode("utf-8"))
+        self.assertEqual(response["id"], 2)
+        self.assertEqual(response["result"]["tools"][0]["name"], "sample")
+
+    def test_bridge_mcp_client_stream_synthesizes_empty_startup_lists(self):
+        messages = [
+            {"jsonrpc": "2.0", "id": 10, "method": "resources/list", "params": {}},
+            {"jsonrpc": "2.0", "id": 11, "method": "resources/templates/list", "params": {}},
+            {"jsonrpc": "2.0", "id": 12, "method": "prompts/list", "params": {}},
+        ]
+        framed = b"".join(main.encode_stdio_json(message) for message in messages)
+        target = RecordingBinarySink()
+        response_target = RecordingBinarySink()
+        starts = []
+
+        main.bridge_mcp_client_stream(
+            io.BytesIO(framed),
+            target,
+            lambda: starts.append("start"),
+            response_target,
+            io.StringIO(),
+        )
+
+        self.assertEqual(starts, [])
+        self.assertEqual(target.getvalue(), b"")
+        responses = []
+        output = io.BytesIO(response_target.getvalue())
+        while True:
+            message = main.read_stdio_message(output)
+            if message is None:
+                break
+            _, payload = message
+            responses.append(json.loads(payload.decode("utf-8")))
+
+        self.assertEqual([response["id"] for response in responses], [10, 11, 12])
+        self.assertEqual(responses[0]["result"], {"resources": []})
+        self.assertEqual(responses[1]["result"], {"resourceTemplates": []})
+        self.assertEqual(responses[2]["result"], {"prompts": []})
+
+    def test_bridge_mcp_client_stream_falls_back_for_tools_list_metadata_failure(self):
+        trigger = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+        framed = main.encode_stdio_json(trigger)
+        target = RecordingBinarySink()
+        response_target = RecordingBinarySink()
+        starts = []
+
+        def fail_metadata():
+            raise RuntimeError("metadata unavailable")
+
+        with mock.patch.object(
+            main, "fallback_tools_list_metadata", return_value={"tools": [{"name": "fallback"}]}
+        ):
+            provider = main.make_tools_list_metadata_provider(["not-npx"], {})
+            main.bridge_mcp_client_stream(
+                io.BytesIO(framed),
+                target,
+                lambda: starts.append("start"),
+                response_target,
+                io.StringIO(),
+                provider,
+            )
+
+        self.assertEqual(starts, [])
+        self.assertEqual(target.getvalue(), b"")
+        _, payload = main.read_stdio_message(io.BytesIO(response_target.getvalue()))
+        response = json.loads(payload.decode("utf-8"))
+        self.assertEqual(response["id"], 2)
+        self.assertEqual(response["result"]["tools"][0]["name"], "fallback")
+
+    def test_tools_list_provider_uses_fallback_without_running_npx(self):
+        with mock.patch.object(main.subprocess, "run") as run, mock.patch.object(
+            main, "fallback_tools_list_metadata", return_value={"tools": [{"name": "fallback"}]}
+        ):
+            provider = main.make_tools_list_metadata_provider(
+                [r"C:\node\npx.cmd", "-y", "chrome-devtools-mcp@latest"],
+                {},
+            )
+
+            self.assertEqual(provider()["tools"][0]["name"], "fallback")
+
+        run.assert_not_called()
 
     def test_bridge_mcp_client_stream_starts_chrome_before_trigger_message(self):
         trigger = {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {}}
@@ -579,6 +819,34 @@ class WrapperHelpersTest(unittest.TestCase):
         self.assertEqual(response["id"], 7)
         self.assertEqual(response["error"]["code"], -32000)
         self.assertIn("Chrome startup failed: boom", response["error"]["message"])
+
+    def test_lazy_downstream_target_does_not_spawn_until_first_write(self):
+        process = mock.Mock()
+        process.stdin = RecordingBinarySink()
+        process.stdout = io.BytesIO(b"")
+        process.pid = 1234
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+
+        with mock.patch.object(main.subprocess, "Popen", return_value=process) as popen:
+            target = main.LazyDownstreamTarget(
+                ["npx", "chrome-devtools-mcp"],
+                {},
+                RecordingBinarySink(),
+                set(),
+                threading.Lock(),
+                io.StringIO(),
+            )
+
+            self.assertEqual(target.poll(), 0)
+            self.assertEqual(target.wait(), 0)
+            popen.assert_not_called()
+
+            target.write(b"Content-Length: 2\r\n\r\n{}")
+            target.flush()
+
+        popen.assert_called_once()
+        self.assertEqual(process.stdin.getvalue(), b"Content-Length: 2\r\n\r\n{}")
 
     @unittest.skipUnless(os.name == "nt", "Windows-specific Chrome cleanup")
     def test_terminate_chrome_profile_processes_filters_by_profile_path(self):

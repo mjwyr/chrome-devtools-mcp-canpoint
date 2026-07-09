@@ -12,9 +12,11 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import uuid
 import urllib.error
 import urllib.request
+from importlib import resources
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -34,6 +36,17 @@ PROFILE_MODES = ("isolated", "inherit", "copy")
 WINDOW_MODES = ("quiet", "visible", "headless")
 LAUNCH_MODES = ("lazy", "eager")
 MCP_LAZY_TRIGGER_METHODS = frozenset({"tools/call", "resources/read", "prompts/get"})
+CHROME_DEVTOOLS_MCP_PACKAGE_NAME = "chrome-devtools-mcp"
+TOOLS_LIST_METADATA_TIMEOUT_SECONDS = 5.0
+MCP_PROTOCOL_VERSION = "2025-06-18"
+PACKAGE_VERSION = "0.1.9"
+DEBUG_LOG_ENV = "CHROME_DEVTOOLS_MCP_CANPOINT_LOG"
+TOOLS_LIST_FALLBACK_RESOURCE = "_tools_list_fallback.json"
+MCP_EMPTY_LIST_RESULTS = {
+    "resources/list": {"resources": []},
+    "resources/templates/list": {"resourceTemplates": []},
+    "prompts/list": {"prompts": []},
+}
 DEFAULT_SOURCE_PROFILE = "Default"
 ALWAYS_EXCLUDED_PROFILE_NAMES = frozenset(
     {
@@ -90,6 +103,13 @@ class ProfilePlan:
     source_user_data_dir: Path | None
     source_profile: str
     include_sensitive_profile_data: bool
+
+
+@dataclass(frozen=True)
+class ChromeDevToolsMcpMetadataCommand:
+    npx_command: str
+    package_spec: str
+    server_args: tuple[str, ...]
 
 
 def find_free_port(host: str = "127.0.0.1") -> int:
@@ -157,35 +177,180 @@ def expand_downstream_command(
     return [arg.format(**replacements) for arg in command]
 
 
+def is_npx_executable(value: str) -> bool:
+    return Path(value).name.lower() in {"npx", "npx.cmd", "npx.exe", "npx.ps1"}
+
+
+def is_chrome_devtools_mcp_package_spec(value: str) -> bool:
+    return value == CHROME_DEVTOOLS_MCP_PACKAGE_NAME or value.startswith(
+        f"{CHROME_DEVTOOLS_MCP_PACKAGE_NAME}@"
+    )
+
+
+def resolve_windows_command_shim(executable: str) -> str:
+    if os.name != "nt":
+        return executable
+    if any(separator in executable for separator in ("/", "\\")) or Path(executable).suffix:
+        return executable
+
+    pathext = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
+    preferred_extensions = (".exe", ".cmd", ".bat", ".com")
+    extensions = sorted(
+        {extension.lower() for extension in pathext if extension},
+        key=lambda extension: preferred_extensions.index(extension)
+        if extension in preferred_extensions
+        else len(preferred_extensions),
+    )
+    for extension in extensions:
+        candidate = shutil.which(f"{executable}{extension}")
+        if candidate:
+            return candidate
+
+    return executable
+
+
+def find_chrome_devtools_mcp_metadata_command(
+    command: Sequence[str],
+) -> ChromeDevToolsMcpMetadataCommand | None:
+    for index, value in enumerate(command):
+        if not is_npx_executable(value):
+            continue
+        for package_index in range(index + 1, len(command)):
+            package_spec = command[package_index]
+            if is_chrome_devtools_mcp_package_spec(package_spec):
+                return ChromeDevToolsMcpMetadataCommand(
+                    npx_command=resolve_windows_command_shim(value),
+                    package_spec=package_spec,
+                    server_args=tuple(command[package_index + 1 :]),
+                )
+    return None
+
+
+def chrome_devtools_mcp_tools_list_metadata(
+    metadata_command: ChromeDevToolsMcpMetadataCommand,
+    env: Mapping[str, str],
+    timeout_seconds: float = TOOLS_LIST_METADATA_TIMEOUT_SECONDS,
+) -> dict:
+    script = r"""
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const packageName = 'chrome-devtools-mcp';
+const serverArgs = JSON.parse(process.argv[2] ?? '[]');
+let packageRoot;
+
+for (const entry of (process.env.PATH || '').split(path.delimiter)) {
+  if (!entry) {
+    continue;
+  }
+  const candidate = path.resolve(entry, '..', packageName);
+  if (fs.existsSync(path.join(candidate, 'package.json'))) {
+    packageRoot = candidate;
+    break;
+  }
+}
+
+if (!packageRoot) {
+  throw new Error(`Could not locate ${packageName} from npx PATH.`);
+}
+
+const importFromRoot = async relativePath => {
+  return import(pathToFileURL(path.join(packageRoot, relativePath)).href);
+};
+
+const { parseArguments } = await importFromRoot('build/src/bin/chrome-devtools-mcp-cli-options.js');
+const { VERSION } = await importFromRoot('build/src/version.js');
+const { createMcpServer } = await importFromRoot('build/src/index.js');
+
+process.argv = ['node', 'chrome-devtools-mcp', ...serverArgs];
+const args = parseArguments(VERSION);
+const { server } = await createMcpServer(args, {});
+const handler = server.server._requestHandlers.get('tools/list');
+if (!handler) {
+  throw new Error('chrome-devtools-mcp did not register a tools/list handler.');
+}
+
+const result = await handler({ method: 'tools/list', params: {} }, {});
+console.log(JSON.stringify(result));
+process.exit(0);
+"""
+    result = subprocess.run(
+        [
+            metadata_command.npx_command,
+            "-y",
+            "-p",
+            metadata_command.package_spec,
+            "node",
+            "--input-type=module",
+            "-",
+            json.dumps(list(metadata_command.server_args)),
+        ],
+        input=script,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=dict(env),
+        timeout=timeout_seconds,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"metadata probe exited {result.returncode}")
+    return json.loads(result.stdout)
+
+
+def fallback_tools_list_metadata() -> dict:
+    resource = resources.files(__package__).joinpath(TOOLS_LIST_FALLBACK_RESOURCE)
+    return json.loads(resource.read_text(encoding="utf-8"))
+
+
+def make_tools_list_metadata_provider(command: Sequence[str], env: Mapping[str, str]):
+    cached_result: dict | None = None
+
+    def provider() -> dict:
+        nonlocal cached_result
+        if cached_result is None:
+            cached_result = fallback_tools_list_metadata()
+        return cached_result
+
+    return provider
+
+
 def encode_stdio_json(message: Mapping[str, object]) -> bytes:
     payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
+    return payload + b"\n"
 
 
 def read_stdio_message(source) -> tuple[bytes, bytes] | None:
-    header_chunks: list[bytes] = []
-    content_length: int | None = None
+    first_line = source.readline()
+    if first_line == b"":
+        return None
 
-    while True:
-        line = source.readline()
-        if line == b"":
-            if header_chunks:
+    name, separator, value = first_line.partition(b":")
+    if separator and name.lower() == b"content-length":
+        header_chunks = [first_line]
+        content_length = int(value.strip())
+
+        while True:
+            line = source.readline()
+            if line == b"":
                 raise EOFError("Incomplete MCP stdio header.")
-            return None
-        header_chunks.append(line)
-        if line in (b"\r\n", b"\n"):
-            break
-        name, separator, value = line.partition(b":")
-        if separator and name.lower() == b"content-length":
-            content_length = int(value.strip())
+            header_chunks.append(line)
+            if line in (b"\r\n", b"\n"):
+                break
+            name, separator, value = line.partition(b":")
+            if separator and name.lower() == b"content-length":
+                content_length = int(value.strip())
 
-    if content_length is None:
-        raise ValueError("MCP stdio message missing Content-Length header.")
+        payload = source.read(content_length)
+        if len(payload) != content_length:
+            raise EOFError("Incomplete MCP stdio payload.")
+        return b"".join(header_chunks), payload
 
-    payload = source.read(content_length)
-    if len(payload) != content_length:
-        raise EOFError("Incomplete MCP stdio payload.")
-    return b"".join(header_chunks), payload
+    stripped = first_line.strip()
+    if not stripped:
+        return read_stdio_message(source)
+    return b"", stripped + b"\n"
 
 
 def decode_json_rpc_payload(payload: bytes) -> dict | None:
@@ -208,6 +373,26 @@ def json_rpc_startup_error(request_id: object, exc: Exception) -> bytes:
                 "message": f"Chrome startup failed: {exc}",
             },
         }
+    )
+
+
+def json_rpc_result_response(request_id: object, result: Mapping[str, object]) -> bytes:
+    return encode_stdio_json({"jsonrpc": "2.0", "id": request_id, "result": dict(result)})
+
+
+def json_rpc_initialize_response(request_id: object) -> bytes:
+    return json_rpc_result_response(
+        request_id,
+        {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {
+                "tools": {},
+            },
+            "serverInfo": {
+                "name": "chrome-devtools-mcp-canpoint",
+                "version": PACKAGE_VERSION,
+            },
+        },
     )
 
 
@@ -454,6 +639,55 @@ def bridge_stream(source, target) -> None:
             if not chunk:
                 break
             os.write(target_fd, chunk)
+    finally:
+        try:
+            target.close()
+        except OSError:
+            pass
+
+
+class DebugLogger:
+    def __init__(self, path: Path | None = None):
+        if path is None:
+            path_value = os.environ.get(DEBUG_LOG_ENV)
+            path = Path(path_value) if path_value else Path(tempfile.gettempdir()) / "chrome-devtools-mcp-canpoint.log"
+        self.path = path
+        self._lock = threading.Lock()
+
+    def write(self, message: str) -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock, self.path.open("a", encoding="utf-8") as log:
+                log.write(f"{timestamp} {message.rstrip()}\n")
+        except OSError:
+            pass
+
+    def flush(self) -> None:
+        return
+
+
+def bridge_mcp_server_stream(source, target, suppressed_response_ids, suppressed_lock) -> None:
+    try:
+        while True:
+            message = read_stdio_message(source)
+            if message is None:
+                break
+            headers, payload = message
+            json_rpc_message = decode_json_rpc_payload(payload)
+            response_id = json_rpc_message.get("id") if json_rpc_message is not None else None
+            if (
+                response_id is not None
+                and json_rpc_message is not None
+                and "method" not in json_rpc_message
+            ):
+                with suppressed_lock:
+                    if response_id in suppressed_response_ids:
+                        suppressed_response_ids.remove(response_id)
+                        continue
+            target.write(headers)
+            target.write(payload)
+            target.flush()
     finally:
         try:
             target.close()
@@ -711,19 +945,74 @@ def remove_directory_with_retries(path: Path, attempts: int = 20, delay_seconds:
             time.sleep(delay_seconds)
 
 
-def bridge_mcp_client_stream(source, target, ensure_chrome, error_target, log_target) -> None:
+def bridge_mcp_client_stream(
+    source,
+    target,
+    ensure_chrome,
+    error_target,
+    log_target,
+    tools_list_metadata_provider=None,
+    suppressed_response_ids=None,
+    suppressed_lock=None,
+) -> None:
     try:
+        initialize_message: tuple[bytes, bytes] | None = None
+        initialized_message: tuple[bytes, bytes] | None = None
+        downstream_initialized = False
+
         while True:
             message = read_stdio_message(source)
             if message is None:
                 break
             headers, payload = message
             json_rpc_message = decode_json_rpc_payload(payload)
+            method = json_rpc_message.get("method") if json_rpc_message is not None else None
+            print(f"client method: {method}", file=log_target)
 
-            if (
-                json_rpc_message is not None
-                and json_rpc_message.get("method") in MCP_LAZY_TRIGGER_METHODS
-            ):
+            if method == "initialize" and json_rpc_message is not None and "id" in json_rpc_message:
+                initialize_message = (headers, payload)
+                if suppressed_response_ids is not None and suppressed_lock is not None:
+                    with suppressed_lock:
+                        suppressed_response_ids.add(json_rpc_message.get("id"))
+                error_target.write(json_rpc_initialize_response(json_rpc_message.get("id")))
+                error_target.flush()
+                print("answered initialize locally", file=log_target)
+                continue
+
+            if method == "notifications/initialized" and json_rpc_message is not None:
+                initialized_message = (headers, payload)
+                print("stored initialized notification", file=log_target)
+                continue
+
+            if method in MCP_EMPTY_LIST_RESULTS and json_rpc_message is not None:
+                if "id" in json_rpc_message:
+                    error_target.write(
+                        json_rpc_result_response(
+                            json_rpc_message.get("id"),
+                            MCP_EMPTY_LIST_RESULTS[method],
+                        )
+                    )
+                    error_target.flush()
+                    print(f"answered {method} locally", file=log_target)
+                continue
+
+            if method == "tools/list" and json_rpc_message is not None:
+                if tools_list_metadata_provider is not None and "id" in json_rpc_message:
+                    try:
+                        metadata = tools_list_metadata_provider()
+                    except Exception as exc:
+                        print(
+                            f"Failed to synthesize chrome-devtools-mcp tools/list metadata: {exc}",
+                            file=log_target,
+                        )
+                    else:
+                        error_target.write(
+                            json_rpc_result_response(json_rpc_message.get("id"), metadata)
+                        )
+                        error_target.flush()
+                        print("answered tools/list from synthesized metadata", file=log_target)
+                        continue
+
                 try:
                     ensure_chrome()
                 except Exception as exc:
@@ -733,10 +1022,42 @@ def bridge_mcp_client_stream(source, target, ensure_chrome, error_target, log_ta
                     else:
                         print(f"Chrome startup failed: {exc}", file=log_target)
                     continue
+                if not downstream_initialized:
+                    print("replaying startup messages to downstream", file=log_target)
+                    if initialize_message is not None:
+                        target.write(initialize_message[0])
+                        target.write(initialize_message[1])
+                    if initialized_message is not None:
+                        target.write(initialized_message[0])
+                        target.write(initialized_message[1])
+                    target.flush()
+                    downstream_initialized = True
+
+            if method in MCP_LAZY_TRIGGER_METHODS:
+                try:
+                    ensure_chrome()
+                except Exception as exc:
+                    if "id" in json_rpc_message:
+                        error_target.write(json_rpc_startup_error(json_rpc_message.get("id"), exc))
+                        error_target.flush()
+                    else:
+                        print(f"Chrome startup failed: {exc}", file=log_target)
+                    continue
+                if not downstream_initialized:
+                    print("replaying startup messages to downstream", file=log_target)
+                    if initialize_message is not None:
+                        target.write(initialize_message[0])
+                        target.write(initialize_message[1])
+                    if initialized_message is not None:
+                        target.write(initialized_message[0])
+                        target.write(initialized_message[1])
+                    target.flush()
+                    downstream_initialized = True
 
             target.write(headers)
             target.write(payload)
             target.flush()
+            print(f"forwarded method downstream: {method}", file=log_target)
     finally:
         try:
             target.close()
@@ -746,38 +1067,151 @@ def bridge_mcp_client_stream(source, target, ensure_chrome, error_target, log_ta
 
 def resolve_downstream_command(command: Sequence[str]) -> list[str]:
     resolved = list(command)
-    if not resolved or os.name != "nt":
+    if not resolved:
         return resolved
 
-    executable = resolved[0]
-    if any(separator in executable for separator in ("/", "\\")) or Path(executable).suffix:
-        return resolved
-
-    pathext = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";")
-    preferred_extensions = (".exe", ".cmd", ".bat", ".com")
-    extensions = sorted(
-        {extension.lower() for extension in pathext if extension},
-        key=lambda extension: preferred_extensions.index(extension)
-        if extension in preferred_extensions
-        else len(preferred_extensions),
-    )
-    for extension in extensions:
-        candidate = shutil.which(f"{executable}{extension}")
-        if candidate:
-            resolved[0] = candidate
-            return resolved
-
+    resolved[0] = resolve_windows_command_shim(resolved[0])
     return resolved
 
 
+class LazyDownstreamTarget:
+    def __init__(
+        self,
+        command: Sequence[str],
+        env: Mapping[str, str],
+        stdout_target,
+        suppressed_response_ids,
+        suppressed_lock,
+        log_target,
+    ):
+        self.command = list(command)
+        self.env = dict(env)
+        self.stdout_target = stdout_target
+        self.suppressed_response_ids = suppressed_response_ids
+        self.suppressed_lock = suppressed_lock
+        self.log_target = log_target
+        self.process: subprocess.Popen[bytes] | None = None
+        self.stdout_thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def ensure_started(self) -> subprocess.Popen[bytes]:
+        with self._lock:
+            if self.process is not None:
+                return self.process
+            print(f"starting downstream: {self.command!r}", file=self.log_target)
+            self.process = subprocess.Popen(
+                self.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=self.env,
+            )
+            if self.process.stdout is None:
+                raise RuntimeError("Downstream stdout pipe was not created.")
+            self.stdout_thread = threading.Thread(
+                target=bridge_mcp_server_stream,
+                args=(
+                    self.process.stdout,
+                    self.stdout_target,
+                    self.suppressed_response_ids,
+                    self.suppressed_lock,
+                ),
+                daemon=True,
+            )
+            self.stdout_thread.start()
+            print(f"downstream started pid={self.process.pid}", file=self.log_target)
+            return self.process
+
+    def write(self, data: bytes) -> int:
+        process = self.ensure_started()
+        if process.stdin is None:
+            raise RuntimeError("Downstream stdin pipe was not created.")
+        return process.stdin.write(data)
+
+    def flush(self) -> None:
+        process = self.ensure_started()
+        if process.stdin is None:
+            raise RuntimeError("Downstream stdin pipe was not created.")
+        process.stdin.flush()
+
+    def close(self) -> None:
+        if self.process is None or self.process.stdin is None:
+            return
+        try:
+            self.process.stdin.close()
+        except OSError:
+            pass
+
+    def wait(self) -> int:
+        if self.process is None:
+            return 0
+        return self.process.wait()
+
+    def poll(self) -> int | None:
+        if self.process is None:
+            return 0
+        return self.process.poll()
+
+    def terminate(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            terminate_process(self.process)
+
+    def join_stdout(self, timeout: float | None = None) -> None:
+        if self.stdout_thread is not None:
+            self.stdout_thread.join(timeout=timeout)
+
+
 def run_downstream(command: Sequence[str], env: Mapping[str, str], ensure_chrome=None) -> int:
+    resolved_command = resolve_downstream_command(command)
+    log_target = DebugLogger()
+    print(f"run_downstream ensure_chrome={ensure_chrome is not None}", file=log_target)
+
+    if ensure_chrome is not None:
+        suppressed_response_ids = set()
+        suppressed_lock = threading.Lock()
+        downstream_target = LazyDownstreamTarget(
+            resolved_command,
+            env,
+            sys.stdout.buffer,
+            suppressed_response_ids,
+            suppressed_lock,
+            log_target,
+        )
+        stdin_thread = threading.Thread(
+            target=bridge_mcp_client_stream,
+            args=(
+                sys.stdin.buffer,
+                downstream_target,
+                ensure_chrome,
+                sys.stdout.buffer,
+                log_target,
+                make_tools_list_metadata_provider(resolved_command, env),
+                suppressed_response_ids,
+                suppressed_lock,
+            ),
+            daemon=True,
+        )
+        stdin_thread.start()
+        try:
+            stdin_thread.join()
+            return downstream_target.wait()
+        except KeyboardInterrupt:
+            downstream_target.terminate()
+            return 130
+        finally:
+            downstream_target.terminate()
+            downstream_target.join_stdout(timeout=1)
+
     downstream = subprocess.Popen(
-        resolve_downstream_command(command),
+        resolved_command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=None,
         env=dict(env),
     )
+
+    suppressed_response_ids = set()
+    suppressed_lock = threading.Lock()
 
     if ensure_chrome is None:
         stdin_thread = threading.Thread(
@@ -794,14 +1228,24 @@ def run_downstream(command: Sequence[str], env: Mapping[str, str], ensure_chrome
                 ensure_chrome,
                 sys.stdout.buffer,
                 sys.stderr,
+                make_tools_list_metadata_provider(resolved_command, env),
+                suppressed_response_ids,
+                suppressed_lock,
             ),
             daemon=True,
         )
-    stdout_thread = threading.Thread(
-        target=bridge_stream,
-        args=(downstream.stdout, sys.stdout.buffer),
-        daemon=True,
-    )
+    if ensure_chrome is None:
+        stdout_thread = threading.Thread(
+            target=bridge_stream,
+            args=(downstream.stdout, sys.stdout.buffer),
+            daemon=True,
+        )
+    else:
+        stdout_thread = threading.Thread(
+            target=bridge_mcp_server_stream,
+            args=(downstream.stdout, sys.stdout.buffer, suppressed_response_ids, suppressed_lock),
+            daemon=True,
+        )
 
     def stop_downstream_when_input_closes() -> None:
         stdin_thread.join()

@@ -1,0 +1,2 @@
+# Runtime dependencies for this project.
+# The package currently uses only the Python standard library.

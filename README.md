@@ -9,9 +9,11 @@ This wrapper gives each MCP server process its own random remote debugging port
 and generated user data directory, so multiple agent sessions do not fight over
 port `9222` or a shared Chrome profile. By default, the actual Chrome process is
 started lazily: normal MCP startup and tool discovery can complete without
-opening a browser, and Chrome is launched only when the conversation first calls
-a browser-backed MCP tool. On Windows it also resolves common command shims such
-as `npx.cmd`, so downstream MCP commands can be passed as normal argument lists.
+opening a browser. In lazy mode the wrapper answers `tools/list` from the
+official `chrome-devtools-mcp` package metadata, then launches Chrome only when
+the conversation first calls a browser-backed MCP tool. On Windows it also
+resolves common command shims such as `npx.cmd`, so downstream MCP commands can
+be passed as normal argument lists.
 
 ## Usage
 
@@ -27,10 +29,11 @@ Example:
 uvx chrome-devtools-mcp-canpoint -- npx -y chrome-devtools-mcp@latest --browser-url={browser_url}
 ```
 
-By default, Chrome starts in lazy mode and uses quiet window startup. Quiet mode
-keeps Chrome headful for compatibility, adds `--start-minimized`, and uses a
-best-effort non-activating minimized startup on Windows. It reduces focus
-stealing but cannot guarantee Chrome or the OS will never focus the window.
+By default, Chrome starts in lazy mode and uses quiet window startup once a
+browser-backed tool is called. Quiet mode keeps Chrome headful for
+compatibility, adds `--start-minimized`, and uses a best-effort non-activating
+minimized startup on Windows. It reduces focus stealing but cannot guarantee
+Chrome or the OS will never focus the window.
 
 Preserve the old startup-time launch behavior with:
 
