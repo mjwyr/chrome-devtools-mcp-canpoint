@@ -39,7 +39,7 @@ MCP_LAZY_TRIGGER_METHODS = frozenset({"tools/call", "resources/read", "prompts/g
 CHROME_DEVTOOLS_MCP_PACKAGE_NAME = "chrome-devtools-mcp"
 TOOLS_LIST_METADATA_TIMEOUT_SECONDS = 5.0
 MCP_PROTOCOL_VERSION = "2025-06-18"
-PACKAGE_VERSION = "0.1.9"
+PACKAGE_VERSION = "0.1.10"
 DEBUG_LOG_ENV = "CHROME_DEVTOOLS_MCP_CANPOINT_LOG"
 TOOLS_LIST_FALLBACK_RESOURCE = "_tools_list_fallback.json"
 MCP_EMPTY_LIST_RESULTS = {
@@ -630,6 +630,20 @@ def wait_for_devtools(port: int, timeout_seconds: float) -> None:
     raise TimeoutError(message)
 
 
+def devtools_endpoint_ready(port: int, timeout_seconds: float = 1.0) -> bool:
+    endpoint = f"{devtools_url(port)}/json/version"
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(endpoint, timeout=0.5) as response:
+                if response.status == 200:
+                    return True
+        except (urllib.error.URLError, TimeoutError, OSError):
+            pass
+        time.sleep(0.1)
+    return False
+
+
 def bridge_stream(source, target) -> None:
     source_fd = source.fileno()
     target_fd = target.fileno()
@@ -832,6 +846,13 @@ class ChromeSessionManager:
         with self._lock:
             if self._started:
                 if self._chrome is not None and self._chrome.poll() is None:
+                    return
+                # The launcher process we spawned may have exited because
+                # Chrome relaunched itself (notably de-elevation when this
+                # wrapper runs elevated). The relaunched browser process keeps
+                # serving the DevTools endpoint under a different pid, so treat
+                # the session as alive as long as the endpoint still responds.
+                if devtools_endpoint_ready(self._port):
                     return
                 raise RuntimeError("Chrome exited before the MCP request could be handled.")
 
